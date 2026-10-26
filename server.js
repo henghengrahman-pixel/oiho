@@ -76,19 +76,25 @@ function text(res,status,message){response(res,status,`<!doctype html><meta char
 function readStore(){fs.mkdirSync(DATA_DIR,{recursive:true});const p=path.join(DATA_DIR,'store.json');if(!fs.existsSync(p))return {websites:[],results:[],audits:[],authSessions:{},marketRecords:[],ptReports:[]};try{const d=JSON.parse(fs.readFileSync(p,'utf8'));if(!d||typeof d!=='object'||Array.isArray(d))throw Error('Invalid store schema');for(const key of ['websites','results','audits','marketRecords','ptReports','agentPtJobs'])if(d[key]!==undefined&&!Array.isArray(d[key]))throw Error('Invalid store array');if(d.security?.encryptedTotpSecret)d.security.totpSecret=decryptAgentSession({encryptedSession:d.security.encryptedTotpSecret});return {...d,ptReports:Array.isArray(d.ptReports)?d.ptReports:[],websites:Array.isArray(d.websites)?d.websites:[],results:Array.isArray(d.results)?d.results:[],audits:Array.isArray(d.audits)?d.audits:[],marketRecords:Array.isArray(d.marketRecords)?d.marketRecords:[],security:d.security&&typeof d.security==='object'?d.security:{},authSessions:d.authSessions&&typeof d.authSessions==='object'&&!Array.isArray(d.authSessions)?d.authSessions:{}}}catch(e){throw Error('Data store unreadable; refusing overwrite')}}
 let store=readStore();
 
-// Auto-seed websites if store is empty (first run / empty volume). Skip during tests.
-if (process.env.NODE_ENV !== 'test' && !fs.existsSync(path.join(DATA_DIR, 'store.json'))) {
-  try {
-    const seedPath = path.join(__dirname, 'data', 'store.json');
-    if (fs.existsSync(seedPath)) {
-      const seed = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
-      if (Array.isArray(seed.websites) && seed.websites.length) {
-        store.websites = seed.websites;
-        console.log('Seeded', store.websites.length, 'websites from data/store.json');
-        save();
+// Idempotent seed reconciliation for existing Railway volumes. Never overwrite agent credentials or admin-edited codes.
+// Back up the original persistent store before the first migration.
+if (process.env.NODE_ENV !== 'test' && process.env.ATLAS_SEED_MIGRATION !== 'off') {
+  const seedPath=path.join(__dirname,'data','store.json');
+  if(fs.existsSync(seedPath)) {
+    const seed=JSON.parse(fs.readFileSync(seedPath,'utf8'));
+    const {reconcileSeed}=require('./seed-reconcile');
+    const original=JSON.stringify(store);
+    const result=reconcileSeed(store,seed);
+    if(result.changed){
+      const currentPath=path.join(DATA_DIR,'store.json');
+      if(fs.existsSync(currentPath)){
+        const backupPath=path.join(DATA_DIR,'store.before-website-seed-v3.json');
+        if(!fs.existsSync(backupPath))fs.copyFileSync(currentPath,backupPath,fs.constants.COPYFILE_EXCL);
       }
+      try{save();console.log('Website seed migration:',result.websitesAdded,'websites added,',result.marketsAdded,'markets added');}
+      catch(e){store=JSON.parse(original);throw e}
     }
-  } catch (e) { console.error('Seed failed:', e.message); }
+  }
 }
 
 for(const job of store.agentPtJobs||[]){if(['RUNNING','QUEUED'].includes(job.status)){job.status='INTERRUPTED';job.reason='SERVER_RESTART';for(const site of job.sites||[])if(['RUNNING','QUEUED'].includes(site.status))site.status='INTERRUPTED'}}
@@ -128,7 +134,7 @@ setImmediate(()=>livePt.runJob(job,{signal:controller.signal,delay:liveRequestOv
 
 function marketManagerPanel(w,s){
  const markets=w.markets||[];
- const rows=markets.map(m=>`<tr><td>${esc(m.name)}</td><td><code>${esc(m.id||m.code)}</code></td><td><form method="post" action="/websites/markets/update" class="form" style="display:flex;gap:6px;align-items:end;flex-wrap:wrap">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><input type="hidden" name="originalId" value="${esc(m.id||m.code)}"><label>Nama<input name="name" value="${esc(m.name)}" required maxlength="80"></label><label>Kode<input name="code" value="${esc(m.id||m.code)}" required maxlength="40"></label><button class="btn">Simpan</button></form><form method="post" action="/websites/markets/delete" onsubmit="return confirm('Hapus pemetaan pasaran ini?')">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><input type="hidden" name="code" value="${esc(m.id||m.code)}"><button class="dangerbtn">Hapus</button></form></td></tr>`).join('');
+ const rows=markets.map(m=>`<tr><td>${esc(m.name)}</td><td><code>${esc(m.id||m.code)}</code></td><td><form method="post" action="/websites/markets/update" class="form" style="display:flex;gap:6px;align-items:end;flex-wrap:wrap">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><input type="hidden" name="originalId" value="${esc(m.id||m.code)}"><label>Nama<input name="name" value="${esc(m.name)}" required maxlength="80"></label><label>Kode<input name="code" value="${esc(m.id||m.code)}" required maxlength="40"></label><button class="btn">Simpan</button></form><form method="post" action="/websites/markets/delete" onsubmit="return confirm('Hapus pemetaan pasaran ini?')">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><input type="hidden" name="code" value="${esc(m.id||m.code)}"><button class="dangerbtn">Hapus</button></form></td></tr>`);
  return panel('Kelola Kode Pasaran — '+w.name,`<p class="helper">${markets.length} pasaran tersimpan. Impor dan edit hanya memengaruhi ${esc(w.name)}. Format TXT: NAMA PASARAN diikuti spasi dan kode, atau CSV: nama_pasaran,kode_pasaran.</p><form method="post" action="/websites/markets/import" class="form">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><label>Upload TXT/CSV<input type="file" accept=".txt,.csv,text/plain,text/csv" onchange="const f=this.files[0];if(f&&f.size<=250000){f.text().then(t=>document.getElementById('market-import-${esc(w.id)}').value=t)}else if(f)alert('Maksimum 250 KB')"></label><label>Pratinjau isi / paste daftar<textarea id="market-import-${esc(w.id)}" name="records" rows="7" maxlength="250000" placeholder="ANDORRA POOL p6593" required></textarea></label><label>Jika nama pasaran sudah ada<select name="mode"><option value="skip">Lewati duplikat</option><option value="update">Perbarui kode dengan nama sama</option></select></label><button class="btn" type="submit" onclick="return confirm('Terapkan import hanya untuk ${esc(w.name)}? Periksa isi daftar sebelum melanjutkan.')">Import Pasaran</button></form><h3>Tambah Satu Pasaran</h3><form method="post" action="/websites/markets/update" class="form">${csrf(s)}<input type="hidden" name="websiteId" value="${esc(w.id)}"><label>Nama Pasaran<input name="name" required maxlength="80"></label><label>Kode Pasaran<input name="code" required maxlength="40"></label><button class="btn">Tambah Pasaran</button></form><h3>Daftar Pasaran</h3><div style="overflow:auto;max-height:650px">${table(['Nama','Kode','Edit / Hapus'],rows)}</div>`);
 }
 function validateMarket(name,code){name=String(name||'').trim().replace(/\s+/g,' ').toUpperCase();code=String(code||'').trim();if(!/^[A-Z0-9][A-Z0-9 _./()-]{1,79}$/.test(name)||!/^[A-Za-z0-9_-]{1,40}$/.test(code))throw Error('Nama atau kode pasaran tidak valid');return {name,id:code,code,catalogSource:'manual'}}
